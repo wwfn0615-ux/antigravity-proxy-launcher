@@ -1,87 +1,152 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 
 internal static class AntigravityProxyLauncher
 {
-    private const string Title = "Antigravity Proxy Launcher";
-    private const string DefaultProxy = "http://127.0.0.1:7892";
+    internal const string Title = "Antigravity Proxy Launcher";
     private const string Usage =
-        "AntigravityProxyLauncher.exe [--proxy <代理地址>]\r\n\r\n" +
-        "可使用 HTTP 或 HTTPS 代理地址。省略 --proxy 时使用 " + DefaultProxy + "。\r\n\r\n" +
-        "示例\r\nAntigravityProxyLauncher.exe --proxy http://127.0.0.1:10809";
+        "双击启动器，检测代理后点击「启动 Antigravity」。\r\n\r\n" +
+        "命令行方式（仅设置 Antigravity 进程代理）\r\n" +
+        "AntigravityProxyLauncher.exe --proxy http://127.0.0.1:7890\r\n" +
+        "可用 --antigravity 指定 Antigravity.exe 的路径。\r\n" +
+        "可用 --restore-browser-proxy 恢复上次中断的浏览器代理。";
 
     [STAThread]
     private static int Main(string[] args)
     {
-        // The Antigravity installer can pass this flag when it restarts via a shortcut.
-        bool restartedAfterUpdate = Array.IndexOf(args, "--updated") >= 0;
-        string[] options = Array.FindAll(args, arg => arg != "--updated");
-
-        if (options.Length == 1 && (options[0] == "--help" || options[0] == "-h"))
+        var options = new LaunchOptions();
+        for (int index = 0; index < args.Length; index++)
         {
-            MessageBox.Show(Usage, Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return 0;
+            string option = args[index];
+            switch (option)
+            {
+                case "--help":
+                case "-h":
+                    MessageBox.Show(Usage, Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return 0;
+                case "--updated":
+                    options.Updated = true;
+                    break;
+                case "--restore-browser-proxy":
+                    options.Restore = true;
+                    break;
+                case "--proxy":
+                    if (++index < args.Length && ProxyAddress.TryParse(args[index], out options.Proxy))
+                        break;
+                    return ShowError("请输入有效的 HTTP、HTTPS 或 SOCKS5 代理地址。", 2);
+                case "--antigravity":
+                    if (++index < args.Length && Installation.IsExecutable(args[index]))
+                    {
+                        options.Executable = Path.GetFullPath(args[index]);
+                        break;
+                    }
+                    return ShowError("请选择已安装的 Antigravity.exe。", 2);
+                default:
+                    return ShowError(Usage, 2);
+            }
         }
 
-        string proxy;
-        if (!TryReadProxy(options, out proxy))
-        {
-            MessageBox.Show("请使用 --proxy 指定有效的 HTTP 或 HTTPS 代理地址。\r\n\r\n" + Usage,
-                Title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return 2;
-        }
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
 
-        try
+        using (var gate = new Mutex(false, @"Local\AntigravityProxyLauncher.Windows"))
         {
-            using (Process.Start(CreateStartInfo(proxy, restartedAfterUpdate))) { }
-            return 0;
-        }
-        catch (Exception error)
-        {
-            MessageBox.Show("无法启动 Google Antigravity。" + Environment.NewLine + error.Message,
-                Title, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
+            bool owner;
+            try { owner = gate.WaitOne(0); }
+            catch (AbandonedMutexException) { owner = true; }
+            if (!owner)
+                return ShowError("启动器已经打开。请回到原来的启动器窗口。", 1);
+
+            try
+            {
+                string recoveryError = null;
+                try { BrowserProxySession.Recover(); }
+                catch (Exception error) { recoveryError = error.Message; }
+
+                if (options.Restore)
+                {
+                    if (recoveryError != null)
+                        return ShowError(recoveryError, 1);
+                    MessageBox.Show("上次的浏览器代理恢复检查已完成。", Title,
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return 0;
+                }
+
+                if (options.Proxy != null)
+                {
+                    string executable = options.Executable ?? Installation.Find();
+                    Launch(executable, options.Proxy, options.Updated);
+                    return 0;
+                }
+
+                Application.Run(new LauncherForm(options.Executable ?? Installation.Find(),
+                    options.Updated, recoveryError));
+                return 0;
+            }
+            catch (Exception error) { return ShowError(error.Message, 1); }
+            finally { gate.ReleaseMutex(); }
         }
     }
 
-    private static bool TryReadProxy(string[] options, out string proxy)
+    internal static void CheckReady(string executable)
     {
-        proxy = DefaultProxy;
-        if (options.Length == 0)
-            return true;
+        if (!Installation.IsExecutable(executable))
+            throw new InvalidOperationException("找不到 Antigravity.exe，请选择安装位置。");
 
-        if (options.Length != 2 || options[0] != "--proxy")
-            return false;
-
-        string candidate = options[1].Trim();
-        Uri address;
-        if (!Uri.TryCreate(candidate, UriKind.Absolute, out address)
-            || (address.Scheme != Uri.UriSchemeHttp && address.Scheme != Uri.UriSchemeHttps)
-            || string.IsNullOrEmpty(address.Host) || address.Port <= 0
-            || address.AbsolutePath != "/" || address.Query.Length != 0 || address.Fragment.Length != 0)
-            return false;
-
-        proxy = candidate;
-        return true;
+        foreach (Process process in Process.GetProcessesByName("Antigravity"))
+        {
+            using (process)
+            {
+                if (!process.HasExited)
+                    throw new InvalidOperationException(
+                        "Antigravity 已在运行。请保存工作并完全退出应用（包括托盘），然后重新点击启动。");
+            }
+        }
     }
 
-    private static ProcessStartInfo CreateStartInfo(string proxy, bool restartedAfterUpdate)
+    internal static void Launch(string executable, ProxyAddress proxy, bool updated)
     {
-        string installDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Programs", "antigravity");
-        var startInfo = new ProcessStartInfo
+        CheckReady(executable);
+        using (Process.Start(CreateStartInfo(executable, proxy, updated))) { }
+    }
+
+    internal static ProcessStartInfo CreateStartInfo(string executable, ProxyAddress proxy, bool updated)
+    {
+        var args = new List<string>();
+        if (updated)
+            args.Add("--updated");
+        args.Add("--proxy-server=" + proxy.Value);
+        args.Add("--proxy-bypass-list=localhost;127.0.0.0/8;[::1]");
+
+        var start = new ProcessStartInfo
         {
-            FileName = Path.Combine(installDirectory, "Antigravity.exe"),
-            WorkingDirectory = installDirectory,
-            Arguments = restartedAfterUpdate ? "--updated" : "",
+            FileName = Path.GetFullPath(executable),
+            WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(executable)),
+            Arguments = CommandLine.QuoteAll(args),
             UseShellExecute = false
         };
-        startInfo.EnvironmentVariables["HTTP_PROXY"] = proxy;
-        startInfo.EnvironmentVariables["HTTPS_PROXY"] = proxy;
-        startInfo.EnvironmentVariables["NO_PROXY"] = "localhost,127.0.0.1,::1";
-        return startInfo;
+        start.EnvironmentVariables["HTTP_PROXY"] = proxy.Value;
+        start.EnvironmentVariables["HTTPS_PROXY"] = proxy.Value;
+        start.EnvironmentVariables["ALL_PROXY"] = proxy.Value;
+        start.EnvironmentVariables["NO_PROXY"] = "localhost,127.0.0.0/8,::1";
+        return start;
+    }
+
+    private static int ShowError(string text, int code)
+    {
+        MessageBox.Show(text, Title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return code;
+    }
+
+    private sealed class LaunchOptions
+    {
+        internal ProxyAddress Proxy;
+        internal string Executable;
+        internal bool Updated;
+        internal bool Restore;
     }
 }
