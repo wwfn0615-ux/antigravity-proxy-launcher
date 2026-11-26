@@ -266,7 +266,7 @@ internal static class ProxyProbe
 
     internal static Task<ProbeResult[]> CheckAsync(ProxyAddress proxy)
     {
-        return Task.WhenAll(Targets.Select(target => Task.Run(() => Check(proxy, target))));
+        return Task.WhenAll(Targets.Select(target => Task.Run(() => CheckWithTimeoutRetry(proxy, target))));
     }
 
     internal static async Task<ProxyAddress> DetectAsync(List<ProxyAddress> candidates)
@@ -286,6 +286,12 @@ internal static class ProxyProbe
         return null;
     }
 
+    private static ProbeResult CheckWithTimeoutRetry(ProxyAddress proxy, string url)
+    {
+        ProbeResult result = Check(proxy, url);
+        return result.ExitCode == 28 ? Check(proxy, url) : result;
+    }
+
     internal static ProbeResult Check(ProxyAddress proxy, string url)
     {
         string curl = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "curl.exe");
@@ -298,7 +304,7 @@ internal static class ProxyProbe
             Arguments = CommandLine.QuoteAll(new[]
             {
                 "-q", "--silent", "--proxy", proxy.CurlValue, "--noproxy", "",
-                "--connect-timeout", "3", "--max-time", "6", "--proto", "=https",
+                "--connect-timeout", "8", "--max-time", "12", "--proto", "=https",
                 "--output", "NUL", "--write-out", "%{http_code} %{http_connect}", url
             }),
             UseShellExecute = false,
@@ -308,7 +314,7 @@ internal static class ProxyProbe
         var result = new ProbeResult { Host = new Uri(url).Host };
         using (Process process = Process.Start(start))
         {
-            if (!process.WaitForExit(7500))
+            if (!process.WaitForExit(13500))
             {
                 process.Kill();
                 result.ExitCode = 28;
